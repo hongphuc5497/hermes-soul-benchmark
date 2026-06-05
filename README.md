@@ -1,4 +1,4 @@
-# soul-bench
+# hermes-soul-benchmark
 
 A/B benchmark two [Hermes Agent](https://github.com/NousResearch/hermes-agent) SOUL.md persona files. Runs identical test prompts against two Hermes profiles, evaluates responses across 7 dimensions, and produces a comparison report.
 
@@ -12,18 +12,31 @@ cp old-soul.md ~/.hermes/profiles/soul-v1/SOUL.md
 cp new-soul.md ~/.hermes/profiles/soul-v2/SOUL.md
 
 # 2. Run benchmark
-python3 soul-bench --profile-a soul-v1 --profile-b soul-v2
+./hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2
 
 # 3. JSON output for programmatic use
-python3 soul-bench --profile-a soul-v1 --profile-b soul-v2 --json > results.json
+./hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2 --json > results.json
+
+# 4. Safe smoke check without invoking Hermes
+./hermes-soul-benchmark --profile-a smoke-a --profile-b smoke-b --dry-run
 ```
 
 ## How It Works
 
-1. Reads test scenarios from `scenarios.json` (10 prompts across 7 dimensions)
+1. Reads test scenarios from the checked-in `scenarios.json` file (10 prompts across 7 dimensions)
 2. Runs each scenario through both profiles via `hermes chat -q -p <profile>`
 3. Evaluates responses against dimension-specific checks (keyword/regex heuristics)
 4. Produces a markdown comparison report with per-scenario scores and aggregate
+
+## Smoke Check
+
+To verify the CLI wiring without requiring Hermes profiles or API calls:
+
+```bash
+./hermes-soul-benchmark --profile-a smoke-a --profile-b smoke-b --dry-run
+```
+
+This should print the scenario count and planned benchmark runs, then exit successfully.
 
 ## Evaluation Dimensions
 
