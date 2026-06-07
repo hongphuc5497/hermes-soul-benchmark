@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""hermes-soul-benchmark — A/B benchmark two Hermes SOUL.md versions.
+"""hermes-soul-benchmark — benchmark multiple Hermes SOUL.md profiles.
 
 Usage:
   hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2
+  hermes-soul-benchmark --profiles soul-v1 soul-v2 soul-v3
   hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2 --scenarios custom.json
-  hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2 --json
-  hermes-soul-benchmark --profile-a soul-v1 --profile-b soul-v2 --timeout 120
+  hermes-soul-benchmark --profiles soul-v1 soul-v2 soul-v3 --json
+  hermes-soul-benchmark --profiles soul-v1 soul-v2 soul-v3 --parallel
+  hermes-soul-benchmark --profiles soul-v1 soul-v2 soul-v3 --timeout 120
 
 Output: a markdown comparison report printed to stdout.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import subprocess
@@ -122,106 +125,261 @@ def evaluate_response(response_text: str, checks: list[str]) -> dict:
     total = len(results)
     return {"checks": results, "score": score, "total": total, "pct": round(score / total * 100, 1) if total else 0}
 
+
+def run_profile_set(profiles: list[str], prompt: str, checks: list[str], timeout: int, parallel: bool = False) -> dict:
+    """Run/evaluate one scenario across all profiles, optionally in parallel."""
+    if parallel:
+        with ThreadPoolExecutor(max_workers=len(profiles)) as executor:
+            future_by_profile = {
+                profile: executor.submit(run_hermes, profile, prompt, timeout)
+                for profile in profiles
+            }
+            runs = {
+                profile: future_by_profile[profile].result()
+                for profile in profiles
+            }
+    else:
+        runs = {
+            profile: run_hermes(profile, prompt, timeout)
+            for profile in profiles
+        }
+
+    return {
+        profile: {**run, **evaluate_response(run["stdout"], checks)}
+        for profile, run in runs.items()
+    }
+
+
+def execution_mode(parallel: bool) -> str:
+    """Return the human-readable execution mode label."""
+    return "parallel per scenario" if parallel else "sequential"
+
+
 # ── REPORTING ──────────────────────────────────────────────────
 
-def generate_report(profile_a: str, profile_b: str, scenarios: list, results: dict) -> str:
-    """Generate a markdown comparison report."""
+def profile_label(index: int) -> str:
+    """Return a compact spreadsheet-like label for a profile column."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    label = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, len(alphabet))
+        label = alphabet[rem] + label
+    return label
+
+
+def aggregate_scores(profiles: list[str], scenarios: list, results: dict) -> dict:
+    """Return aggregate score/max/pct per profile."""
+    aggregate = {}
+    for profile in profiles:
+        score = sum(results[s["id"]][profile]["score"] for s in scenarios)
+        max_score = sum(results[s["id"]][profile]["total"] for s in scenarios)
+        aggregate[profile] = {
+            "score": score,
+            "max": max_score,
+            "pct": round(score / max_score * 100, 1) if max_score else 0,
+        }
+    return aggregate
+
+
+def format_score(result: dict) -> str:
+    """Return a compact score cell for reports."""
+    return f"{result.get('pct', 0)}% ({result.get('score', 0)}/{result.get('total', 0)})"
+
+
+def scenario_winner(profiles: list[str], scenario_results: dict) -> str:
+    """Return the winning profile name for one scenario, or Tie."""
+    scores = {profile: scenario_results[profile].get("pct", 0) for profile in profiles}
+    best = max(scores.values()) if scores else 0
+    winners = [profile for profile, pct in scores.items() if pct == best]
+    return winners[0] if len(winners) == 1 else "Tie"
+
+
+def count_wins(profiles: list[str], scenarios: list, results: dict) -> dict:
+    """Return scenario win counts per profile."""
+    wins = {profile: 0 for profile in profiles}
+    for scenario in scenarios:
+        winner = scenario_winner(profiles, results[scenario["id"]])
+        if winner != "Tie":
+            wins[winner] += 1
+    return wins
+
+
+def dimension_averages(profiles: list[str], scenarios: list, results: dict) -> dict:
+    """Return average percentage scores grouped by dimension."""
+    dims = {}
+    for scenario in scenarios:
+        dimension = scenario["dimension"]
+        dims.setdefault(dimension, {profile: [] for profile in profiles})
+        for profile in profiles:
+            dims[dimension][profile].append(results[scenario["id"]][profile].get("pct", 0))
+
+    return {
+        dimension: {
+            profile: round(sum(scores) / len(scores), 1) if scores else 0
+            for profile, scores in data.items()
+        }
+        for dimension, data in dims.items()
+    }
+
+
+def generate_report(profiles: list[str], scenarios: list, results: dict) -> str:
+    """Generate a markdown comparison report for two or more profiles."""
     lines = []
     lines.append(f"# SOUL.md Benchmark Report")
     lines.append(f"")
-    lines.append(f"**Profile A:** `{profile_a}` | **Profile B:** `{profile_b}`")
-    lines.append(f"**Scenarios:** {len(scenarios)} | **Date:** {time.strftime('%Y-%m-%d %H:%M')}")
+    profile_summary = " | ".join(
+        f"**Profile {profile_label(i)}:** `{profile}`" for i, profile in enumerate(profiles)
+    )
+    lines.append(profile_summary)
+    lines.append(f"**Scenarios:** {len(scenarios)} | **Profiles:** {len(profiles)} | **Date:** {time.strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"")
 
     # Per-scenario results
     lines.append("## Results by Scenario")
     lines.append("")
-    lines.append("| # | Scenario | Dimension | A Score | B Score | Winner |")
-    lines.append("|---|----------|-----------|---------|---------|--------|")
+    score_headers = [f"{profile_label(i)} Score" for i in range(len(profiles))]
+    lines.append("| # | Scenario | Dimension | " + " | ".join(score_headers) + " | Winner |")
+    lines.append("|---|----------|-----------|" + "---------|" * len(profiles) + "--------|")
 
-    a_total, b_total = 0, 0
-    a_max, b_max = 0, 0
     for i, s in enumerate(scenarios):
-        ra = results.get(f"{s['id']}_a", {})
-        rb = results.get(f"{s['id']}_b", {})
-        sa = ra.get("pct", 0)
-        sb = rb.get("pct", 0)
-        a_total += ra.get("score", 0)
-        b_total += rb.get("score", 0)
-        a_max += ra.get("total", 0)
-        b_max += rb.get("total", 0)
-        winner = "A" if sa > sb else ("B" if sb > sa else "Tie")
-        lines.append(f"| {i+1} | {s['id']} | {s['dimension']} | {sa}% ({ra.get('score',0)}/{ra.get('total',0)}) | {sb}% ({rb.get('score',0)}/{rb.get('total',0)}) | {winner} |")
+        scenario_results = results[s["id"]]
+        score_cells = [format_score(scenario_results[profile]) for profile in profiles]
+        winner = scenario_winner(profiles, scenario_results)
+        lines.append(f"| {i+1} | {s['id']} | {s['dimension']} | " + " | ".join(score_cells) + f" | {winner} |")
 
     lines.append("")
     lines.append("## Aggregate Scores")
     lines.append("")
-    a_pct = round(a_total / a_max * 100, 1) if a_max else 0
-    b_pct = round(b_total / b_max * 100, 1) if b_max else 0
+    aggregate = aggregate_scores(profiles, scenarios, results)
     lines.append(f"| Profile | Total Score | Percentage | Scenarios Won |")
     lines.append(f"|---------|-------------|------------|---------------|")
-    wins_a = sum(1 for s in scenarios if results.get(f"{s['id']}_a", {}).get("pct", 0) > results.get(f"{s['id']}_b", {}).get("pct", 0))
-    wins_b = sum(1 for s in scenarios if results.get(f"{s['id']}_b", {}).get("pct", 0) > results.get(f"{s['id']}_a", {}).get("pct", 0))
-    lines.append(f"| **{profile_a}** | {a_total}/{a_max} | {a_pct}% | {wins_a} |")
-    lines.append(f"| **{profile_b}** | {b_total}/{b_max} | {b_pct}% | {wins_b} |")
+    wins = count_wins(profiles, scenarios, results)
+    for profile in profiles:
+        data = aggregate[profile]
+        lines.append(f"| **{profile}** | {data['score']}/{data['max']} | {data['pct']}% | {wins[profile]} |")
     lines.append("")
 
     # Dimension breakdown
     lines.append("## Dimension Breakdown")
     lines.append("")
-    lines.append("| Dimension | Weight | A Avg | B Avg | Delta |")
-    lines.append("|-----------|--------|-------|-------|-------|")
-    dims = {}
-    for s in scenarios:
-        d = s["dimension"]
-        if d not in dims:
-            dims[d] = {"a_scores": [], "b_scores": [], "weight": 0}
-        ra = results.get(f"{s['id']}_a", {})
-        rb = results.get(f"{s['id']}_b", {})
-        dims[d]["a_scores"].append(ra.get("pct", 0))
-        dims[d]["b_scores"].append(rb.get("pct", 0))
-
-    for dim, data in sorted(dims.items()):
-        a_avg = round(sum(data["a_scores"]) / len(data["a_scores"]), 1) if data["a_scores"] else 0
-        b_avg = round(sum(data["b_scores"]) / len(data["b_scores"]), 1) if data["b_scores"] else 0
-        delta = round(b_avg - a_avg, 1)
-        sign = f"+{delta}" if delta > 0 else str(delta)
-        lines.append(f"| {dim} | - | {a_avg}% | {b_avg}% | {sign} |")
+    avg_headers = [f"{profile_label(i)} Avg" for i in range(len(profiles))]
+    lines.append("| Dimension | Weight | " + " | ".join(avg_headers) + " | Leader |")
+    lines.append("|-----------|--------|" + "-------|" * len(profiles) + "--------|")
+    for dim, averages in sorted(dimension_averages(profiles, scenarios, results).items()):
+        best = max(averages.values()) if averages else 0
+        leaders = [profile for profile, avg in averages.items() if avg == best]
+        leader = leaders[0] if len(leaders) == 1 else "Tie"
+        avg_cells = [f"{averages[profile]}%" for profile in profiles]
+        lines.append(f"| {dim} | - | " + " | ".join(avg_cells) + f" | {leader} |")
 
     lines.append("")
     lines.append("## Verdict")
     lines.append("")
-    if b_pct > a_pct:
-        lines.append(f"**{profile_b} wins** by {round(b_pct - a_pct, 1)} percentage points ({wins_b} vs {wins_a} scenarios).")
-    elif a_pct > b_pct:
-        lines.append(f"**{profile_a} wins** by {round(a_pct - b_pct, 1)} percentage points ({wins_a} vs {wins_b} scenarios).")
+    best_pct = max(data["pct"] for data in aggregate.values()) if aggregate else 0
+    leaders = [profile for profile, data in aggregate.items() if data["pct"] == best_pct]
+    if len(leaders) == 1:
+        leader = leaders[0]
+        runner_up = max(
+            (data["pct"] for profile, data in aggregate.items() if profile != leader),
+            default=best_pct,
+        )
+        lines.append(f"**{leader} wins** by {round(best_pct - runner_up, 1)} percentage points.")
     else:
-        lines.append(f"**Tie.** Both profiles scored {a_pct}%.")
+        lines.append(f"**Tie.** {', '.join(leaders)} scored {best_pct}%.")
     lines.append("")
     
     # Elapsed times
     lines.append("## Response Times")
     lines.append("")
-    lines.append("| # | Scenario | A Time | B Time |")
-    lines.append("|---|----------|--------|--------|")
+    time_headers = [f"{profile_label(i)} Time" for i in range(len(profiles))]
+    lines.append("| # | Scenario | " + " | ".join(time_headers) + " |")
+    lines.append("|---|----------|" + "--------|" * len(profiles))
     for i, s in enumerate(scenarios):
-        ta = results.get(f"{s['id']}_a", {}).get("elapsed", "N/A")
-        tb = results.get(f"{s['id']}_b", {}).get("elapsed", "N/A")
-        lines.append(f"| {i+1} | {s['id']} | {ta}s | {tb}s |")
+        time_cells = [f"{results[s['id']][profile].get('elapsed', 'N/A')}s" for profile in profiles]
+        lines.append(f"| {i+1} | {s['id']} | " + " | ".join(time_cells) + " |")
 
     return "\n".join(lines)
+
+
+def normalize_profiles(args) -> list[str]:
+    """Resolve legacy two-profile args or new multi-profile args."""
+    if args.profiles:
+        if args.profile_a or args.profile_b:
+            raise ValueError("Use either --profiles or --profile-a/--profile-b, not both")
+        profiles = args.profiles
+    else:
+        if not args.profile_a or not args.profile_b:
+            raise ValueError("Provide --profiles p1 p2 [p3...] or both --profile-a and --profile-b")
+        profiles = [args.profile_a, args.profile_b]
+
+    if len(profiles) < 2:
+        raise ValueError("At least two profiles are required")
+    duplicates = sorted({profile for profile in profiles if profiles.count(profile) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate profiles are not allowed: {', '.join(duplicates)}")
+    return profiles
+
+
+def add_two_profile_compat(output: dict, profiles: list[str], results: dict | None = None, scenario_id: str | None = None) -> None:
+    """Add legacy A/B fields when exactly two profiles are selected."""
+    if len(profiles) != 2:
+        return
+
+    if results is None:
+        output["profile_a"] = profiles[0]
+        output["profile_b"] = profiles[1]
+        a_data = output["aggregate"][profiles[0]]
+        b_data = output["aggregate"][profiles[1]]
+        output["aggregate"].update({
+            "a_score": a_data["score"], "a_max": a_data["max"], "a_pct": a_data["pct"],
+            "b_score": b_data["score"], "b_max": b_data["max"], "b_pct": b_data["pct"],
+        })
+        return
+
+    output["a"] = results[scenario_id][profiles[0]]
+    output["b"] = results[scenario_id][profiles[1]]
+
+
+def build_json_output(profiles: list[str], scenarios: list, results: dict) -> dict:
+    """Build machine-readable output, including A/B compatibility for two profiles."""
+    output = {
+        "profiles": profiles,
+        "scenarios": [],
+        "aggregate": aggregate_scores(profiles, scenarios, results),
+    }
+    add_two_profile_compat(output, profiles)
+
+    for s in scenarios:
+        row = {
+            "id": s["id"],
+            "dimension": s["dimension"],
+            "results": {profile: results[s["id"]][profile] for profile in profiles},
+            "winner": scenario_winner(profiles, results[s["id"]]),
+        }
+        add_two_profile_compat(row, profiles, results, s["id"])
+        output["scenarios"].append(row)
+
+    return output
 
 # ── MAIN ───────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="A/B benchmark two Hermes SOUL.md versions")
-    parser.add_argument("--profile-a", required=True, help="Profile name for SOUL.md version A (e.g., soul-v1)")
-    parser.add_argument("--profile-b", required=True, help="Profile name for SOUL.md version B (e.g., soul-v2)")
+    parser = argparse.ArgumentParser(description="Benchmark two or more Hermes SOUL.md profiles")
+    parser.add_argument("--profiles", nargs="+", help="Profile names to compare in one run (e.g., soul-v1 soul-v2 soul-v3)")
+    parser.add_argument("--profile-a", help="Legacy profile name for SOUL.md version A (e.g., soul-v1)")
+    parser.add_argument("--profile-b", help="Legacy profile name for SOUL.md version B (e.g., soul-v2)")
     parser.add_argument("--scenarios", help="Path to scenarios JSON (default: ./scenarios.json next to the script)")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per hermes run in seconds (default: 120)")
+    parser.add_argument("--parallel", action="store_true", help="Run selected profiles concurrently within each scenario")
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of markdown report")
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without executing")
     args = parser.parse_args()
+
+    try:
+        profiles = normalize_profiles(args)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Load scenarios
     scenarios_path = Path(args.scenarios) if args.scenarios else DEFAULT_SCENARIOS
@@ -233,65 +391,43 @@ def main():
     scenarios = data["scenarios"]
 
     if args.dry_run:
-        print(f"Would run {len(scenarios)} scenarios × 2 profiles = {len(scenarios)*2} hermes invocations")
+        print(f"Would run {len(scenarios)} scenarios × {len(profiles)} profiles = {len(scenarios)*len(profiles)} hermes invocations")
+        print(f"Profiles: {', '.join(profiles)}")
+        print(f"Mode: {execution_mode(args.parallel)}")
         for i, s in enumerate(scenarios):
             print(f"  {i+1}. [{s['dimension']}] {s['id']}: {s['prompt'][:60]}...")
         return
 
     # Verify profiles
-    for p in [args.profile_a, args.profile_b]:
+    for p in profiles:
         soul_path = Path.home() / ".hermes" / "profiles" / p / "SOUL.md"
         if not soul_path.exists():
             print(f"Error: profile '{p}' has no SOUL.md at {soul_path}", file=sys.stderr)
             sys.exit(1)
 
     results = {}
-    total = len(scenarios) * 2
-    print(f"Running {total} benchmarks ({len(scenarios)} scenarios × 2 profiles)...", file=sys.stderr)
-    print(f"Profile A: {args.profile_a} | Profile B: {args.profile_b}", file=sys.stderr)
+    total = len(scenarios) * len(profiles)
+    print(f"Running {total} benchmarks ({len(scenarios)} scenarios × {len(profiles)} profiles)...", file=sys.stderr)
+    print(f"Profiles: {', '.join(profiles)}", file=sys.stderr)
+    print(f"Mode: {execution_mode(args.parallel)}", file=sys.stderr)
     print(f"", file=sys.stderr)
 
     for i, s in enumerate(scenarios):
         print(f"[{i+1}/{len(scenarios)}] {s['id']}...", file=sys.stderr, end=" ", flush=True)
-        
-        # Run profile A
-        ra = run_hermes(args.profile_a, s["prompt"], args.timeout)
-        ev_a = evaluate_response(ra["stdout"], s["checks"])
-        results[f"{s['id']}_a"] = {**ra, **ev_a}
+        results[s["id"]] = run_profile_set(profiles, s["prompt"], s["checks"], args.timeout, parallel=args.parallel)
+        progress = [
+            f"{profile}:{results[s['id']][profile]['pct']}%"
+            for profile in profiles
+        ]
 
-        # Run profile B
-        rb = run_hermes(args.profile_b, s["prompt"], args.timeout)
-        ev_b = evaluate_response(rb["stdout"], s["checks"])
-        results[f"{s['id']}_b"] = {**rb, **ev_b}
-
-        print(f"A:{ev_a['pct']}% B:{ev_b['pct']}%", file=sys.stderr)
+        print(" ".join(progress), file=sys.stderr)
 
     if args.json:
         # Machine-readable output
-        output = {
-            "profile_a": args.profile_a,
-            "profile_b": args.profile_b,
-            "scenarios": [],
-            "aggregate": {},
-        }
-        for s in scenarios:
-            output["scenarios"].append({
-                "id": s["id"],
-                "dimension": s["dimension"],
-                "a": results[f"{s['id']}_a"],
-                "b": results[f"{s['id']}_b"],
-            })
-        a_total = sum(results[f"{s['id']}_a"]["score"] for s in scenarios)
-        b_total = sum(results[f"{s['id']}_b"]["score"] for s in scenarios)
-        a_max = sum(results[f"{s['id']}_a"]["total"] for s in scenarios)
-        b_max = sum(results[f"{s['id']}_b"]["total"] for s in scenarios)
-        output["aggregate"] = {
-            "a_score": a_total, "a_max": a_max, "a_pct": round(a_total/a_max*100, 1) if a_max else 0,
-            "b_score": b_total, "b_max": b_max, "b_pct": round(b_total/b_max*100, 1) if b_max else 0,
-        }
+        output = build_json_output(profiles, scenarios, results)
         print(json.dumps(output, indent=2))
     else:
-        report = generate_report(args.profile_a, args.profile_b, scenarios, results)
+        report = generate_report(profiles, scenarios, results)
         print(report)
 
 if __name__ == "__main__":
