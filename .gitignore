@@ -5,3 +5,6 @@ results/
 *.json.tmp
 benchmark_*.json
 benchmark_*.log
+
+# Agent Ops runtime directory (managed by agent-ops init).
+.ai/
